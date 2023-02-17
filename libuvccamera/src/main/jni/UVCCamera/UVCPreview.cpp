@@ -46,6 +46,9 @@
 #define PREVIEW_PIXEL_BYTES 4	// RGBA/RGBX
 #define FRAME_POOL_SZ MAX_FRAME + 2
 
+struct timespec ts;
+struct timeval tv;
+
 UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 :	mPreviewWindow(NULL),
 	mCaptureWindow(NULL),
@@ -72,10 +75,12 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	ENTER();
 	pthread_cond_init(&preview_sync, NULL);
 	pthread_mutex_init(&preview_mutex, NULL);
-//
+    // 初始化并关联 capture_clock_attr
+    //pthread_condattr_init(&capture_clock_attr);
+    //pthread_condattr_setclock(&capture_clock_attr, CLOCK_MONOTONIC);
 	pthread_cond_init(&capture_sync, NULL);
 	pthread_mutex_init(&capture_mutex, NULL);
-//	
+
 	pthread_mutex_init(&pool_mutex, NULL);
 	EXIT();
 }
@@ -92,10 +97,14 @@ UVCPreview::~UVCPreview() {
 	clearPreviewFrame();
 	clearCaptureFrame();
 	clear_pool();
+	pthread_mutex_lock(&preview_mutex);
 	pthread_mutex_destroy(&preview_mutex);
 	pthread_cond_destroy(&preview_sync);
+	pthread_mutex_lock(&capture_mutex);
 	pthread_mutex_destroy(&capture_mutex);
 	pthread_cond_destroy(&capture_sync);
+	// 释放 capture_clock_aatr
+    // pthread_condattr_destroy(&capture_clock_attr);
 	pthread_mutex_destroy(&pool_mutex);
 	EXIT();
 }
@@ -169,7 +178,7 @@ inline const bool UVCPreview::isRunning() const {return mIsRunning; }
 
 int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth) {
 	ENTER();
-	
+
 	int result = 0;
 	if ((requestWidth != width) || (requestHeight != height) || (requestMode != mode)) {
 		requestWidth = width;
@@ -184,7 +193,7 @@ int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, 
 			!requestMode ? UVC_FRAME_FORMAT_YUYV : UVC_FRAME_FORMAT_MJPEG,
 			requestWidth, requestHeight, requestMinFps, requestMaxFps);
 	}
-	
+
 	RETURN(result, int);
 }
 
@@ -207,7 +216,7 @@ int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 }
 
 int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
-	
+
 	ENTER();
 	pthread_mutex_lock(&capture_mutex);
 	{
@@ -356,30 +365,38 @@ int UVCPreview::stopPreview() {
 	bool b = isRunning();
 	if (LIKELY(b)) {
 		mIsRunning = false;
-		pthread_cond_signal(&preview_sync);
-		pthread_cond_signal(&capture_sync);
-		if (pthread_join(capture_thread, NULL) != EXIT_SUCCESS) {
-			LOGW("UVCPreview::terminate capture thread: pthread_join failed");
+        pthread_cond_signal(&preview_sync);
+        // jiangdg:fix stopview crash
+        // because of capture_thread may null when called do_preview()
+		if (mHasCapturing) {
+            pthread_cond_signal(&capture_sync);
+            if (capture_thread && pthread_join(capture_thread, NULL) != EXIT_SUCCESS) {
+                LOGW("UVCPreview::terminate capture thread: pthread_join failed");
+            }
 		}
-		if (pthread_join(preview_thread, NULL) != EXIT_SUCCESS) {
+		if (preview_thread && pthread_join(preview_thread, NULL) != EXIT_SUCCESS) {
 			LOGW("UVCPreview::terminate preview thread: pthread_join failed");
 		}
 		clearDisplay();
 	}
+	mHasCapturing = false;
 	clearPreviewFrame();
 	clearCaptureFrame();
-	pthread_mutex_lock(&preview_mutex);
-	if (mPreviewWindow) {
-		ANativeWindow_release(mPreviewWindow);
-		mPreviewWindow = NULL;
+	// check preview mutex available
+	if (pthread_mutex_lock(&preview_mutex) == 0) {
+		if (mPreviewWindow) {
+			ANativeWindow_release(mPreviewWindow);
+			mPreviewWindow = NULL;
+		}
+		pthread_mutex_unlock(&preview_mutex);
 	}
-	pthread_mutex_unlock(&preview_mutex);
-	pthread_mutex_lock(&capture_mutex);
-	if (mCaptureWindow) {
-		ANativeWindow_release(mCaptureWindow);
-		mCaptureWindow = NULL;
+	if (pthread_mutex_lock(&capture_mutex) == 0) {
+		if (mCaptureWindow) {
+			ANativeWindow_release(mCaptureWindow);
+			mCaptureWindow = NULL;
+		}
+		pthread_mutex_unlock(&capture_mutex);
 	}
-	pthread_mutex_unlock(&capture_mutex);
 	RETURN(0, int);
 }
 
@@ -516,10 +533,14 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	uvc_frame_t *frame_mjpeg = NULL;
 	uvc_error_t result = uvc_start_streaming_bandwidth(
 		mDeviceHandle, ctrl, uvc_preview_frame_callback, (void *)this, requestBandwidth, 0);
-
+    // jiangdg:fix stopview crash
+    // use mHasCapturing flag confirm capture_thread was be created
+    mHasCapturing = false;
 	if (LIKELY(!result)) {
 		clearPreviewFrame();
-		pthread_create(&capture_thread, NULL, capture_thread_func, (void *)this);
+		if (pthread_create(&capture_thread, NULL, capture_thread_func, (void *)this) == 0) {
+		    mHasCapturing = true;
+		}
 
 #if LOCAL_DEBUG
 		LOGI("Streaming...");
@@ -707,6 +728,9 @@ void UVCPreview::addCaptureFrame(uvc_frame_t *frame) {
 		}
 		captureQueu = frame;
 		pthread_cond_broadcast(&capture_sync);
+	} else {
+		// Add this can solve native leak
+		recycle_frame(frame);
 	}
 	pthread_mutex_unlock(&capture_mutex);
 }
@@ -719,7 +743,25 @@ uvc_frame_t *UVCPreview::waitCaptureFrame() {
 	pthread_mutex_lock(&capture_mutex);
 	{
 		if (!captureQueu) {
-			pthread_cond_wait(&capture_sync, &capture_mutex);
+			 //  这里有阻塞的情况，替换成 pthread_cond_timedwait 方法，设置相对的超时时间为 1s
+             //pthread_cond_wait(&capture_sync, &capture_mutex);
+            /*struct timespec tv;
+            clock_gettime(CLOCK_MONOTONIC, &tv);
+            tv.tv_sec += 1;
+            pthread_cond_timedwait(&capture_sync, &capture_mutex,&tv);*/
+                ts.tv_sec = 0;
+                ts.tv_nsec = 0;
+
+            #if _POSIX_TIMERS > 0
+                      clock_gettime(CLOCK_REALTIME, &ts);
+            #else
+                      gettimeofday(&tv, NULL);
+                      ts.tv_sec = tv.tv_sec;
+                      ts.tv_nsec = tv.tv_usec * 1000;
+            #endif
+                      ts.tv_sec += 1;
+                      ts.tv_nsec += 0;
+            pthread_cond_timedwait(&capture_sync, &capture_mutex,&ts);
 		}
 		if (LIKELY(isRunning() && captureQueu)) {
 			frame = captureQueu;
@@ -791,11 +833,11 @@ void UVCPreview::do_capture(JNIEnv *env) {
 
 void UVCPreview::do_capture_idle_loop(JNIEnv *env) {
 	ENTER();
-	
+
 	for (; isRunning() && isCapturing() ;) {
 		do_capture_callback(env, waitCaptureFrame());
 	}
-	
+
 	EXIT();
 }
 
@@ -865,7 +907,9 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
 				}
 			}
 			jobject buf = env->NewDirectByteBuffer(callback_frame->data, callbackPixelBytes);
-			env->CallVoidMethod(mFrameCallbackObj, iframecallback_fields.onFrame, buf);
+			if (iframecallback_fields.onFrame) {
+				env->CallVoidMethod(mFrameCallbackObj, iframecallback_fields.onFrame, buf);
+			}
 			env->ExceptionClear();
 			env->DeleteLocalRef(buf);
 		}
